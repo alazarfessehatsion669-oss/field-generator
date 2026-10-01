@@ -1,0 +1,203 @@
+import hashlib
+import re
+from pathlib import Path
+
+import numpy as np
+from scipy.io import wavfile
+
+DESCRIPTION = """
+Ancient royal dark fantasy. Two voices, gold and purple.
+Hands that almost touch. Slow, ceremonial. Deep, heavy, ancient.
+Never Cinderella.
+"""
+
+DEFAULT_REFUSALS = [
+    "waltz", "disney", "princess", "cinderella", "pop",
+    "ballroom", "happy", "upbeat", "bright", "cheerful",
+]
+
+ORDER_SEQUENCE = [
+    "CB1_identity",
+    "CB2_extension",
+    "CB3_hook",
+    "CB4_bass_open",
+    "CB5_loop",
+    "CB6_compression",
+    "CB7_closure",
+]
+
+
+def normalize_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def check_refusals(text: str, refusals=None):
+    refusals = refusals or DEFAULT_REFUSALS
+    cleaned = normalize_text(text)
+    for term in refusals:
+        if term in cleaned.split():
+            raise ValueError(f"Refused term detected: {term}")
+    return True
+
+
+def keyword_to_orders(text: str):
+    tokens = normalize_text(text).split()
+    features = {
+        "royal": "CB1_identity",
+        "ancient": "CB1_identity",
+        "dark": "CB6_compression",
+        "fantasy": "CB2_extension",
+        "two": "CB5_loop",
+        "voices": "CB5_loop",
+        "gold": "CB3_hook",
+        "purple": "CB3_hook",
+        "hands": "CB2_extension",
+        "touch": "CB3_hook",
+        "slow": "CB7_closure",
+        "ceremonial": "CB1_identity",
+        "deep": "CB4_bass_open",
+        "heavy": "CB4_bass_open",
+        "ancient": "CB1_identity",
+        "never": "CB7_closure",
+    }
+
+    orders = []
+    for token in tokens:
+        order = features.get(token)
+        if order is not None:
+            orders.append(order)
+
+    if not orders:
+        orders = list(ORDER_SEQUENCE)
+
+    # Ensure a stable, compact sequence
+    return [order for order in orders if order in ORDER_SEQUENCE]
+
+
+def _sine_segment(sample_rate, duration_seconds, frequency, amplitude, phase=0.0):
+    n = int(sample_rate * duration_seconds)
+    t = np.arange(n, dtype=np.float32) / sample_rate
+    return amplitude * np.sin(2.0 * np.pi * frequency * t + phase).astype(np.float32)
+
+
+def _render_order(order_name, token, sample_rate):
+    duration = token["duration_seconds"]
+    start = token["start_sample"]
+    base_freq = {
+        "CB1_identity": 110.0,
+        "CB2_extension": 220.0,
+        "CB3_hook": 330.0,
+        "CB4_bass_open": 82.41,
+        "CB5_loop": 174.61,
+        "CB6_compression": 196.0,
+        "CB7_closure": 261.63,
+    }.get(order_name, 220.0)
+
+    amplitude = {
+        "CB1_identity": 0.52,
+        "CB2_extension": 0.58,
+        "CB3_hook": 0.44,
+        "CB4_bass_open": 0.62,
+        "CB5_loop": 0.50,
+        "CB6_compression": 0.48,
+        "CB7_closure": 0.60,
+    }.get(order_name, 0.50)
+
+    # Envelope shaping for the order
+    n = int(sample_rate * duration)
+    t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+
+    if order_name == "CB1_identity":
+        envelope = np.ones_like(t)
+    elif order_name == "CB2_extension":
+        envelope = np.linspace(0.1, 1.0, n, dtype=np.float32)
+    elif order_name == "CB3_hook":
+        envelope = np.exp(-8.0 * t)
+    elif order_name == "CB4_bass_open":
+        envelope = np.linspace(0.35, 1.0, n, dtype=np.float32)
+    elif order_name == "CB5_loop":
+        envelope = 0.7 + 0.3 * np.sin(2.0 * np.pi * 4.0 * t)
+    elif order_name == "CB6_compression":
+        envelope = np.linspace(1.0, 0.18, n, dtype=np.float32)
+    elif order_name == "CB7_closure":
+        envelope = np.linspace(0.2, 1.0, n, dtype=np.float32)
+    else:
+        envelope = np.ones_like(t)
+
+    tone = _sine_segment(sample_rate, duration, base_freq, amplitude)
+    tone = tone * envelope
+    tone = np.clip(tone, -1.0, 1.0)
+    return tone.astype(np.float32)
+
+
+def build_order_tokens(description: str, sample_rate=44100):
+    seq = keyword_to_orders(description)
+    tokens = []
+    cur_time = 0.0
+    step = 0.8
+
+    for idx, order in enumerate(seq):
+        duration = step
+        if order == "CB7_closure":
+            duration = 1.2
+        if order == "CB4_bass_open":
+            duration = 1.0
+        if order == "CB5_loop":
+            duration = 0.9
+
+        start_sample = int(cur_time * sample_rate)
+        tokens.append({
+            "name": order,
+            "start_sample": start_sample,
+            "duration_seconds": duration,
+            "duration_samples": int(duration * sample_rate),
+        })
+        cur_time += duration
+
+    return tokens
+
+
+def decode_orders(orders, sample_rate=44100, total_samples=None):
+    if not orders:
+        return np.zeros(0, dtype=np.float32)
+
+    if total_samples is None:
+        total_samples = max(token["start_sample"] + token["duration_samples"] for token in orders)
+
+    signal = np.zeros(total_samples, dtype=np.float32)
+    weights = np.zeros(total_samples, dtype=np.float32)
+
+    for token in orders:
+        rendered = _render_order(token["name"], token, sample_rate)
+        start = token["start_sample"]
+        stop = min(start + len(rendered), total_samples)
+        signal[start:stop] += rendered[: stop - start]
+        weights[start:stop] += 1.0
+
+    signal = np.divide(signal, weights, out=np.zeros_like(signal), where=weights > 0)
+    signal = np.clip(signal, -1.0, 1.0)
+    return signal
+
+
+def render_wav(signal, output_path, sample_rate=44100):
+    output = np.clip(signal, -1.0, 1.0)
+    output = (output * 32767).astype(np.int16)
+    wavfile.write(output_path, sample_rate, output)
+    return output_path
+
+
+def generate(description: str = DESCRIPTION, output_path: str = "output.wav"):
+    check_refusals(description)
+    tokens = build_order_tokens(description)
+    signal = decode_orders(tokens)
+    render_wav(signal, output_path)
+    return output_path
+
+
+if __name__ == "__main__":
+    output = generate(DESCRIPTION, "output.wav")
+    print(f"Wrote: {output}")
+    print(f"SHA256 of output: {hashlib.sha256(Path(output).read_bytes()).hexdigest()}")
